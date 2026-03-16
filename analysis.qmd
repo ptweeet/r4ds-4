@@ -1,0 +1,226 @@
+---
+title: "NBA and FIFA"
+author: "Alec Rogers"
+format: html
+execute:
+    echo: false
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(arrow)
+  library(plotly)
+  library(viridis)
+  library(scales)
+})
+```
+
+```{r}
+open_dataset("data/game.parquet") |>
+  select(team_name_home, pts_home) |>
+  collect() |>
+  filter(!is.na(team_name_home)) |>
+  group_by(team_name_home) |>
+  summarise(
+    avg_pts = mean(pts_home, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(avg_pts)) |>
+  slice_head(n = 4) |>
+  mutate(
+    team_name_home = fct_reorder(team_name_home, avg_pts)
+  )
+```
+
+```{r}
+open_dataset("data/line_score.parquet") |>
+  collect() |>
+  mutate(
+    game_date = as_date(ymd_hms(game_date_est)),
+    game_year = year(game_date),
+    game_month = month(game_date, label = TRUE),
+    game_weekday = wday(game_date, label = TRUE),
+    team_abbreviation_home = as_factor(team_abbreviation_home) |>
+      fct_recode(
+        Warriors = "PHW",
+        Lakers = "MNL"
+      ) |>
+      fct_lump(n = 8),
+    home_result = case_when(
+      pts_home > pts_away ~ "Win",
+      pts_home < pts_away ~ "Loss",
+      TRUE ~ "Tie"
+    ) |>
+      factor(levels = c("Win", "Loss", "Tie")),
+    margin_category = case_when(
+      abs(pts_home - pts_away) <= 3 ~ "Close",
+      abs(pts_home - pts_away) <= 15 ~ "Moderate",
+      TRUE ~ "Blowout"
+    ) |>
+      factor(levels = c("Close", "Moderate", "Blowout")) |>
+      fct_relevel("Close", "Moderate", "Blowout"),
+    era = case_when(
+      game_year < 1970 ~ "Early NBA",
+      game_year < 2000 ~ "Classic Era",
+      TRUE ~ "Modern"
+    ) |>
+      factor() |>
+      fct_relevel("Early NBA", "Classic Era", "Modern"),
+    month_start = floor_date(game_date, unit = "month"),
+    days_since_jan1 = as.integer(game_date - floor_date(game_date, "year")),
+    next_week = game_date + days(7)
+  ) |>
+  arrange(game_date) |>
+  slice_head(n = 1000) |>
+  count(era, margin_category)
+```
+
+```{r}
+#| cache: true
+
+nba_clean <- open_dataset("data/game.parquet") |>
+  collect() |>
+  left_join(
+    open_dataset("data/line_score.parquet") |> collect(),
+    by = "game_id",
+    relationship = "many-to-many"
+  ) |>
+  mutate(
+    game_date = ymd_hms(game_date),
+    game_date_est = ymd_hms(game_date_est)
+  ) |>
+  drop_na(pts_home.x)|>
+    mutate(
+    game_date = as_datetime(game_date),
+    game_year = year(game_date),
+    season_label = paste0(season_id %/% 10000, "-", str_sub(season_id + 1, 3, 4))
+  ) |>
+  filter(!is.na(game_date), game_year >= 1946) |>
+    mutate(
+    wl_home = factor(wl_home, levels = c("W", "L")),
+    game_era = case_when(
+      game_year <= 1979 ~ "Pre-Three Point",
+      game_year <= 1999 ~ "Modern Era", 
+      game_year <= 2019 ~ "Analytics Era",
+      TRUE ~ "Current Era"
+    ),
+    game_era = factor(game_era, levels = c("Pre-Three Point", "Modern Era", "Analytics Era", "Current Era"))
+  ) |>  
+    mutate(
+        across(contains("pct"), ~replace_na(.x, 0)),
+        across(c(pts_home.x, pts_away.x), ~replace_na(.x, 0)),
+        total_points = pts_home.x + pts_away.x
+     ) |>
+     filter(total_points > 0, !is.na(pts_home.x), !is.na(pts_away.x))|>
+  group_by(game_year, game_era, season_label) |>
+  summarise(
+    avg_points = mean(total_points, na.rm = TRUE),
+    games_count = n(),
+    home_win_pct = mean(wl_home == "W", na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(game_year)
+```
+
+```{r}
+ggplot(nba_clean, aes(x = game_year, y = avg_points, color = game_era)) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(size = games_count), alpha = 0.8) +
+  scale_size(range = c(1, 6), name = "Games in Season") +
+  scale_color_brewer(palette = "Set1", name = "NBA Era") +
+  labs(
+    title = "Evolution of NBA Scoring by Era",
+    subtitle = "Average total points per game increased across NBA history",
+    x = "Season Year",
+    y = "Average Total Points per Game",
+    caption = "Data: NBA game + line_score datasets"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+```{r}
+#| cache: true
+
+final_fifa <- "data/fifa.parquet" |>
+  open_dataset() |>
+  collect() |>
+  mutate(
+    height_cm = as.numeric(str_extract(Height, "\\d+")),
+    weight_kg = as.numeric(str_extract(Weight, "\\d+"))
+  ) |>
+  mutate(across(where(is.character), ~str_replace_all(.x, "\\n", ""))) |>
+  mutate(across(where(is.character), ~str_trim(.x))) |>
+  mutate(
+    joined_date = mdy(Joined),
+    years_at_club = as.numeric(today() - joined_date) / 365.25,
+    long_tenure = years_at_club > 10
+  ) |>
+  drop_na(joined_date) |>
+  mutate(
+    value_numeric = case_when(
+      is.na(Value) | Value == "" | Value == "0" ~ 0,
+      str_detect(Value, "M") ~ as.numeric(str_remove_all(Value, "[€M★-]")) * 1000000,
+      str_detect(Value, "K") ~ as.numeric(str_remove_all(Value, "[€K★-]")) * 1000,
+      str_detect(Value, "^€?[0-9.]+$") ~ as.numeric(str_remove_all(Value, "€")),
+      TRUE ~ 0
+    ),
+    wage_numeric = case_when(
+      is.na(Wage) | Wage == "" | Wage == "0" ~ 0,
+      str_detect(Wage, "K") ~ as.numeric(str_remove_all(Wage, "[€K★-]")) * 1000,
+      str_detect(Wage, "^€?[0-9.]+$") ~ as.numeric(str_remove_all(Wage, "€")),
+      TRUE ~ 0
+    ),
+    release_clause_numeric = case_when(
+      is.na(Release.Clause) | Release.Clause == "" | Release.Clause == "0" ~ 0,
+      str_detect(Release.Clause, "M") ~ as.numeric(str_remove_all(Release.Clause, "[€M★-]")) * 1000000,
+      str_detect(Release.Clause, "K") ~ as.numeric(str_remove_all(Release.Clause, "[€K★-]")) * 1000,
+      str_detect(Release.Clause, "^€?[0-9.]+$") ~ as.numeric(str_remove_all(Release.Clause, "€")),
+      TRUE ~ 0
+    )
+  )
+```
+
+```{r}
+final_fifa |>
+  filter(!is.na(Age), !is.na(X.OVA), !is.na(Value)) |>
+  mutate(
+    value_numeric = case_when(
+      str_detect(Value, "M") ~ as.numeric(str_remove_all(Value, "[€M]")) * 1e6,
+      str_detect(Value, "K") ~ as.numeric(str_remove_all(Value, "[€K]")) * 1e3,
+      TRUE ~ as.numeric(str_remove_all(Value, "€"))
+    )
+  ) |>
+  filter(value_numeric > 5e6) |>
+  ggplot(aes(x = Age, y = X.OVA)) +
+  geom_jitter(
+    aes(size = value_numeric, color = Best.Position),
+    alpha = 0.6,
+    width = 0.2
+  ) +
+  geom_smooth(method = "loess", color = "black", se = FALSE) +
+  scale_size_continuous(
+    labels = label_dollar(prefix = "€"),
+    range = c(2, 10)
+  ) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(
+    title = "FIFA Player Performance Across Age",
+    subtitle = "Elite players tend to peak in their mid-to-late 20s",
+    x = "Player Age",
+    y = "Overall Rating",
+    size = "Market Value",
+    color = "Best Position",
+    caption = "Data: FIFA Player Dataset"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+```
